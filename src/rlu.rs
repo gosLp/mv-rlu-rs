@@ -1,11 +1,12 @@
 #![allow(dead_code, unused_variables)]
 
 use std::fmt::Debug;
-use std::mem;
+use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::thread;
 use std::usize;
+use std::cell::UnsafeCell;
 
 const RLU_MAX_LOG_SIZE: usize = 128;
 const RLU_MAX_THREADS: usize = 32;
@@ -16,6 +17,7 @@ pub struct ObjOriginal<T> {
   data: T,
 }
 
+#[derive(Clone)]
 pub struct ObjCopy<T> {
   thread_id: usize,
   original: RluObject<T>,
@@ -40,12 +42,37 @@ impl<T> RluObject<T> {
   fn deref_mut(&mut self) -> &mut ObjOriginal<T> {
     unsafe { &mut *self.0 }
   }
+
+  pub fn null() -> RluObject<T> {
+    RluObject(ptr::null_mut())
+  }
 }
 
 struct WriteLog<T> {
-  entries: [ObjCopy<T>; RLU_MAX_LOG_SIZE],
+  entries: [MaybeUninit<ObjCopy<T>>; RLU_MAX_LOG_SIZE],
   num_entries: usize,
 }
+
+impl<T> WriteLog<T> {
+  pub fn new() -> Self {
+    Self {
+      entries: unsafe { MaybeUninit::uninit().assume_init() },
+      num_entries: 0,
+    }
+  }
+  
+}
+
+impl<T> Drop for WriteLog<T> {
+  fn drop(&mut self) {
+      for i in 0..self.num_entries {
+          unsafe {
+              self.entries.get_unchecked_mut(i).assume_init_drop();
+          }
+      }
+  }
+}
+
 
 pub struct RluThread<T> {
   logs: [WriteLog<T>; 2],
@@ -62,9 +89,11 @@ pub struct RluThread<T> {
 
 pub struct Rlu<T> {
   global_clock: AtomicUsize,
-  threads: [RluThread<T>; RLU_MAX_THREADS],
+  threads: [UnsafeCell<RluThread<T>>; RLU_MAX_THREADS],
   num_threads: AtomicUsize,
 }
+
+unsafe impl<T> Sync for Rlu<T> where T: Sync { }
 
 unsafe impl<T> Send for RluObject<T> {}
 unsafe impl<T> Sync for RluObject<T> {}
@@ -81,7 +110,7 @@ pub trait RluBounds: Clone + Debug {}
 impl<T: Clone + Debug> RluBounds for T {}
 
 impl<T> WriteLog<T> {
-  fn next_entry(&mut self) -> &mut ObjCopy<T> {
+  fn next_entry(&mut self, thread_id: usize, data: T, original: RluObject<T>) -> &mut ObjCopy<T> {
     let i = self.num_entries;
     self.num_entries += 1;
 
@@ -89,33 +118,49 @@ impl<T> WriteLog<T> {
       assert!(self.num_entries < RLU_MAX_LOG_SIZE)
     }
 
-    unsafe { self.entries.get_unchecked_mut(i) }
+    unsafe { 
+      let entry = self.entries.get_unchecked_mut(i);
+      entry.write(ObjCopy{
+        thread_id,
+        original,
+        data,
+      });
+      entry.assume_init_mut()
+    }
   }
 }
 
+
 impl<T: RluBounds> Rlu<T> {
   pub fn new() -> Rlu<T> {
+    let mut threads: [MaybeUninit<UnsafeCell<RluThread<T>>>; RLU_MAX_THREADS] =
+      unsafe { MaybeUninit::uninit().assume_init() };
+    for elem in &mut threads {
+      elem.write(UnsafeCell::new(RluThread::new())); // Wrap each cell in unsafe thread
+    }
+    let threads: [UnsafeCell<RluThread<T>>; RLU_MAX_THREADS] =
+      unsafe { std::mem::MaybeUninit::array_assume_init(threads) };
     Rlu {
       global_clock: AtomicUsize::new(0),
       num_threads: AtomicUsize::new(0),
-      threads: unsafe { mem::uninitialized() },
+      threads,
     }
   }
 
-  pub fn thread(&self) -> &mut RluThread<T> {
+  pub fn thread(&mut self) -> &mut RluThread<T> {
     let thread_id = self.num_threads.fetch_add(1, Ordering::SeqCst);
-    let thread: *mut RluThread<T> =
-      &self.threads[thread_id] as *const RluThread<T> as *mut RluThread<T>;
+    let thread: *mut RluThread<T> = unsafe { &mut *self.threads[thread_id].get()};
     let thread: &mut RluThread<T> = unsafe { &mut *thread };
     *thread = RluThread::new();
     thread.thread_id = thread_id;
     thread.global = self as *const Rlu<T>;
-    return thread;
+    thread
   }
 
   fn get_thread(&self, index: usize) -> *mut RluThread<T> {
-    (unsafe { self.threads.get_unchecked(index) }) as *const RluThread<T>
-      as *mut RluThread<T>
+    // (unsafe { self.threads.get_unchecked(index) }) as *const RluThread<T>
+    //   as *mut RluThread<T>
+    unsafe { self.threads.get_unchecked(index).get() }
   }
 
   pub fn alloc(&self, data: T) -> RluObject<T> {
@@ -189,18 +234,23 @@ impl<'a, T: RluBounds> RluSession<'a, T> {
       }
     }
 
+    let data_clone = obj.deref().data.clone();
     let active_log = &mut self.t.logs[self.t.current_log];
-    let copy = active_log.next_entry();
+    let copy = active_log.next_entry(self.t.thread_id, data_clone, obj);
     copy.thread_id = self.t.thread_id;
     copy.data = obj.deref().data.clone();
     copy.original = obj;
-    let prev_ptr = obj.deref_mut().copy.compare_and_swap(
+    let prev_ptr = obj.deref_mut().copy.compare_exchange(
       ptr::null_mut(),
-      copy,
+      copy as *mut _,
+      Ordering::SeqCst,
       Ordering::SeqCst,
     );
-    if prev_ptr != ptr::null_mut() {
+    if prev_ptr.is_err() {
       active_log.num_entries -= 1;
+      unsafe {
+        active_log.entries.get_unchecked_mut(active_log.num_entries).assume_init_drop();
+      }
       return None;
     }
 
@@ -230,8 +280,22 @@ impl<'a, T: RluBounds> Drop for RluSession<'a, T> {
 
 impl<T: RluBounds> RluThread<T> {
   fn new() -> RluThread<T> {
+    let mut logs: [MaybeUninit<WriteLog<T>>; 2] =
+      unsafe { MaybeUninit::uninit().assume_init() };
+    for elm in &mut logs {
+      elm.write(WriteLog::new());
+    }
+    let logs: [WriteLog<T>; 2] = unsafe { std::mem::MaybeUninit::array_assume_init(logs) };
+    let mut free_list: [MaybeUninit<RluObject<T>>; RLU_MAX_FREE_NODES] =
+      unsafe { MaybeUninit::uninit().assume_init() };
+    for elm in &mut free_list {
+      elm.write(RluObject::null());
+    }
+    let free_list: [RluObject<T>; RLU_MAX_FREE_NODES] =
+      unsafe { std::mem::transmute(free_list) };
     let mut thread = RluThread {
-      logs: unsafe { mem::uninitialized() },
+      //logs: unsafe { mem::uninitialized() },
+      logs,
       current_log: 0,
       is_writer: false,
       write_clock: usize::MAX,
@@ -240,7 +304,7 @@ impl<T: RluBounds> RluThread<T> {
       thread_id: 0,
       global: ptr::null(),
       num_free: 0,
-      free_list: unsafe { mem::uninitialized() },
+      free_list,
     };
 
     for i in 0..2 {
@@ -283,7 +347,9 @@ impl<T: RluBounds> RluThread<T> {
 
   fn process_free(&mut self) {
     for i in 0..self.num_free {
-      unsafe { Box::from_raw(self.free_list[i].0) };
+      unsafe { 
+        drop(Box::from_raw(self.free_list[i].0));
+      };
     }
 
     self.num_free = 0;
@@ -317,7 +383,7 @@ impl<T: RluBounds> RluThread<T> {
     log!(self, "writeback_logs");
     let active_log = &mut self.logs[self.current_log];
     for i in 0..active_log.num_entries {
-      let copy = &mut active_log.entries[i];
+      let copy = unsafe { active_log.entries.get_unchecked_mut(i).assume_init_mut() };
       log!(self, format!("copy {:?} ({:p})", copy.data, &copy.data));
       let orig = copy.original.deref_mut();
       orig.data = copy.data.clone();
@@ -328,8 +394,15 @@ impl<T: RluBounds> RluThread<T> {
     log!(self, "unlock_write_log");
     let active_log = &mut self.logs[self.current_log];
     for i in 0..active_log.num_entries {
-      let orig = active_log.entries[i].original.deref_mut();
+      let copy: &mut ObjCopy<T> = unsafe { active_log.entries.get_unchecked_mut(i).assume_init_mut() };
+      let orig = copy.original.deref_mut();
       orig.copy.store(ptr::null_mut(), Ordering::SeqCst);
+    }
+    // Drop the initialized entries to avoid memory leaks
+    for i in 0..active_log.num_entries {
+      unsafe {
+          active_log.entries.get_unchecked_mut(i).assume_init_drop();
+      }
     }
     active_log.num_entries = 0;
   }
@@ -347,7 +420,12 @@ impl<T: RluBounds> RluThread<T> {
     let global = unsafe { &*self.global };
     let num_threads = global.num_threads.load(Ordering::SeqCst);
     let run_counts: Vec<usize> = (0..num_threads)
-      .map(|i| global.threads[i].run_counter.load(Ordering::SeqCst))
+      .map(|i| {
+        unsafe {
+          let thread = &*global.threads[i].get(); // ACcess the inner RluThread
+          thread.run_counter.load(Ordering::SeqCst)
+        }
+      })
       .collect();
 
     for i in 0..num_threads {
@@ -355,18 +433,27 @@ impl<T: RluBounds> RluThread<T> {
         continue;
       }
 
-      let thread = &global.threads[i];
-      loop {
-        log!(self, format!("wait on thread {}: rc {}, counter {}, write clock {}, local clock {}", i, run_counts[i], thread.run_counter.load(Ordering::SeqCst), self.write_clock, thread.local_clock.load(Ordering::SeqCst)));
+      // let thread = &global.threads[i];
+      unsafe {
+        let thread = &*global.threads[i].get(); //Access the inner RluThread
+        loop {
+          log!(self, format!(
+            "wait on thread {}: rc {}, counter {}, write clock {}, local clock {}",
+            i,
+            run_counts[i],
+            thread.run_counter.load(Ordering::SeqCst),
+            self.write_clock,
+            thread.local_clock.load(Ordering::SeqCst)
+          ));
 
-        if run_counts[i] % 2 == 0
-          || thread.run_counter.load(Ordering::SeqCst) != run_counts[i]
-          || self.write_clock <= thread.local_clock.load(Ordering::SeqCst)
-        {
-          break;
+          if run_counts[i] % 2 == 0
+              || thread.run_counter.load(Ordering::SeqCst) != run_counts[i]
+              || self.write_clock <= thread.local_clock.load(Ordering::SeqCst)
+          {
+            break;
+          }
+          thread::yield_now();
         }
-
-        thread::yield_now();
       }
     }
   }
